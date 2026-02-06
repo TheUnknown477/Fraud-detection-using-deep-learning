@@ -41,10 +41,12 @@ A lightweight Flask web app is provided to score individual transactions using t
   - Uncertainty‑gated update policy: high‑uncertainty samples are always used for updates.[1]
 
 - Baselines Implemented  
+  - XGBoost gradient boosted trees.[5]
+  - Random Forest with balanced class weights.
+  - SVM (SGDClassifier with calibrated probabilities).
+  - K-Nearest Neighbors (KNN).
   - Static MLP (one‑shot training, no updates).[5]
-  - Periodic retraining with sliding window.[3]
-  - Online fine‑tuning without drift detection.[4]
-  - Drift‑triggered fine‑tuning without uncertainty.[7]
+  - Adaptive MLP with MC Dropout uncertainty and ADWIN drift detection.[1][7]
 
 - Flask Web App  
   - Loads exported model weights and preprocessing artifacts.[10][9]
