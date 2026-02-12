@@ -1,6 +1,6 @@
-# Adaptive Credit Card Fraud Detection with Concept Drift and Uncertainty (IEEE‑CIS)
+# Adaptive Credit Card Fraud Detection with Concept Drift (IEEE‑CIS)
 
-This project implements an adaptive deep learning pipeline for credit card fraud detection on the IEEE‑CIS Fraud Detection dataset. It focuses on concept drift, verification latency (delayed labels), and uncertainty‑aware learning, then exposes the trained model through a simple Flask web app for demo purposes.[1][2]
+This project implements an adaptive XGBoost-based pipeline for credit card fraud detection on the IEEE‑CIS Fraud Detection dataset. It focuses on concept drift, verification latency (delayed labels), and incremental learning, then exposes the trained model through a simple Flask web app for demo purposes.[1][2]
 
 ***
 
@@ -13,11 +13,10 @@ Real‑world fraud detection systems face three major challenges:
 
 This project addresses these issues by:
 
-- Using a deep MLP model trained on the IEEE‑CIS dataset for fraud probability estimation.[2][5]
+- Using **XGBoost with incremental learning** trained on the IEEE‑CIS dataset for fraud probability estimation.[2][5]
 - Simulating a streaming setting using `TransactionDT`, where transactions arrive chronologically and labels are revealed after a fixed delay.[6][1]
-- Applying online fine‑tuning when delayed labels arrive (continual learning).[4]
+- Applying online incremental training when delayed labels arrive (continual learning).[4]
 - Detecting concept drift with the ADWIN algorithm and triggering stronger adaptation when performance degrades.[7][8]
-- Using Monte Carlo Dropout to estimate predictive uncertainty and prioritizing high‑uncertainty transactions for simulated “manual review” and model updates.[1]
 
 A lightweight Flask web app is provided to score individual transactions using the trained model, suitable for demonstrations and UI integration.[9][10]
 
@@ -29,24 +28,24 @@ A lightweight Flask web app is provided to score individual transactions using t
   - Download and merge IEEE‑CIS transaction and identity tables.[2]
   - Select key features; handle missing values, encode categoricals, and standardize numerics.
 
-- Deep Learning Model (PyTorch)  
-  - MLP with BatchNorm, ReLU, and Dropout, trained using binary cross‑entropy and Adam.[5]
-  - Monte Carlo Dropout for uncertainty estimation at inference.[1]
+- XGBoost Model with Online Learning  
+  - XGBoost gradient boosting with incremental training capability.[5]
+  - Drift‑triggered updates using `xgb.train()` with `xgb_model` parameter.[5]
 
 - Adaptive Learning Pipeline  
   - Streaming simulation based on `TransactionDT`.[6]
   - Delayed label queue to model verification latency.[1]
-  - Online fine‑tuning on recent labeled samples (replay buffer).[4]
+  - Online incremental training on recent labeled samples (replay buffer).[4]
   - ADWIN drift detector over prediction error stream for drift‑triggered adaptation.[8][7]
-  - Uncertainty‑gated update policy: high‑uncertainty samples are always used for updates.[1]
+  - Drift‑triggered update policy: more aggressive training when drift is detected.[7]
 
 - Baselines Implemented  
   - XGBoost gradient boosted trees.[5]
   - Random Forest with balanced class weights.
   - SVM (SGDClassifier with calibrated probabilities).
   - K-Nearest Neighbors (KNN).
-  - Static MLP (one‑shot training, no updates).[5]
-  - Adaptive MLP with MC Dropout uncertainty and ADWIN drift detection.[1][7]
+  - Static XGBoost (one‑shot training, no updates).[5]
+  - **XGBoost Adaptive** with incremental learning and ADWIN drift detection (main method).[7][5]
 
 - Flask Web App  
   - Loads exported model weights and preprocessing artifacts.[10][9]
@@ -73,11 +72,11 @@ Results show that the full method (delay‑aware, drift‑triggered, uncertainty
 1. Training and Experiments (Colab)  
    - Open the provided Colab notebook.  
    - Run data preprocessing, model training, and streaming experiments.  
-   - Export `fraud_mlp.pth`, `scaler.pkl`, `encoders.pkl`, and `feature_cols.pkl`.
+   - Export `fraud_xgboost.json`, `scaler.pkl`, `encoders.pkl`, and `feature_cols.pkl`.
 
 2. Web App  
    - Place exported artifacts in `model/` and `artifacts/`.  
-   - Install dependencies: `pip install flask torch scikit-learn joblib`.[9][10]
+   - Install dependencies: `pip install flask xgboost scikit-learn joblib`.[9][10]
    - Run `python app.py` and open `http://127.0.0.1:5000/`.
 
 ***
