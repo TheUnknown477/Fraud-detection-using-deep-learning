@@ -17,7 +17,6 @@ This project addresses these issues by:
 - Simulating a streaming setting using `TransactionDT`, where transactions arrive chronologically and labels are revealed after a fixed delay.[6][1]
 - Applying online incremental training when delayed labels arrive (continual learning).[4]
 - Detecting concept drift with the ADWIN algorithm and triggering stronger adaptation when performance degrades.[7][8]
-- Using Monte Carlo Dropout to estimate predictive uncertainty and prioritizing high‑uncertainty transactions for simulated “manual review” and model updates.[1]
 
 A lightweight Flask web app is provided to score individual transactions using the trained model, suitable for demonstrations and UI integration.[9][10]
 
@@ -31,14 +30,14 @@ A lightweight Flask web app is provided to score individual transactions using t
 
 - XGBoost Model with Online Learning  
   - XGBoost gradient boosting with incremental training capability.[5]
-  - Drift-triggered updates using `xgb.train()` with `xgb_model` parameter.[5]
+  - Drift‑triggered updates using `xgb.train()` with `xgb_model` parameter.[5]
 
 - Adaptive Learning Pipeline  
   - Streaming simulation based on `TransactionDT`.[6]
   - Delayed label queue to model verification latency.[1]
   - Online incremental training on recent labeled samples (replay buffer).[4]
   - ADWIN drift detector over prediction error stream for drift‑triggered adaptation.[8][7]
-  - Drift-triggered update policy: more aggressive training when drift is detected.[7]
+  - Drift‑triggered update policy: more aggressive training when drift is detected.[7]
 
 - Baselines Implemented  
   - XGBoost gradient boosted trees.[5]
