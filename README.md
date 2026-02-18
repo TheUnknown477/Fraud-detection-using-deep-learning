@@ -70,8 +70,8 @@ A lightweight Flask web app is provided to score individual transactions using t
 - Baselines Implemented  
   - XGBoost gradient boosted trees.[5]
   - Random Forest with balanced class weights.
-  - SVM (SGDClassifier with calibrated probabilities).
-  - K-Nearest Neighbors (KNN).
+  - Logistic Regression with L1 regularization.
+  - LightGBM gradient boosting classifier.
   - Static XGBoost (one‑shot training, no updates).[5]
   - **XGBoost Adaptive** with incremental learning and ADWIN drift detection (main method).[7][5]
 
