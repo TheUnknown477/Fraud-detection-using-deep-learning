@@ -20,7 +20,7 @@ import torch.nn as nn
 # =========================
 # Artifact path (Google Drive)
 # =========================
-ART_DIR = Path("/content/drive/MyDrive/Colab_Notebooks/fraud_app/results")
+ART_DIR = Path("/content/drive/MyDrive/Colab Notebooks/fraud_app/results")
 
 
 # =========================
@@ -74,7 +74,6 @@ def load_artifacts():
             "In Colab, run drive.mount('/content/drive') and ensure artifacts exist in this folder."
         )
 
-    # Required
     feature_input_cols = joblib.load(ART_DIR / "feature_input_cols.pkl")
     te = joblib.load(ART_DIR / "target_encoder.pkl")
     scaler = joblib.load(ART_DIR / "scaler.pkl")
@@ -83,7 +82,6 @@ def load_artifacts():
     with open(ART_DIR / "target_mean.json", "r") as f:
         target_mean = json.load(f)["target_mean"]
 
-    # Optional
     medians = {}
     medians_path = ART_DIR / "medians.json"
     if medians_path.exists():
@@ -123,7 +121,6 @@ def preprocess_raw_to_features(
 ) -> pd.DataFrame:
     df = df_raw.copy()
 
-    # Required columns
     required = ["TransactionDT", "TransactionAmt"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -146,7 +143,6 @@ def preprocess_raw_to_features(
             df[c] = df[c].astype("object").fillna("missing")
 
     # Numeric fill using saved medians when available
-    # (If your medians.json doesn't include V columns, those V NaNs will be handled below.)
     for col, med in medians.items():
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(med)
@@ -164,12 +160,11 @@ def preprocess_raw_to_features(
             df[f"{card_col}_fraud_rate"] = df[f"{card_col}_fraud_rate"].fillna(target_mean)
             df[f"{card_col}_count"] = df[f"{card_col}_count"].fillna(0)
 
-    # PCA for V columns (expects V1..V339)
+    # PCA for V columns
     v_cols = [c for c in df.columns if c.startswith("V")]
     if not v_cols:
         raise ValueError("No V* columns found. Upload must include V1..V339.")
 
-    # stable order V1, V2, ...
     def v_key(c):
         try:
             return int(c[1:])
@@ -178,16 +173,13 @@ def preprocess_raw_to_features(
 
     v_cols = sorted(v_cols, key=v_key)
 
-    # Fill V NaNs (fallback to 0 if not covered by medians)
-    Xv_df = df[v_cols].apply(pd.to_numeric, errors="coerce")
-    Xv_df = Xv_df.fillna(0.0)
+    Xv_df = df[v_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     Xv = Xv_df.values.astype(np.float32)
 
     Xv_pca = pca.transform(Xv)
     for i in range(Xv_pca.shape[1]):
         df[f"V_pca_{i}"] = Xv_pca[:, i]
 
-    # Drop raw V columns and raw TransactionDT (as in notebook)
     df = df.drop(columns=v_cols)
     if "TransactionDT" in df.columns:
         df = df.drop(columns=["TransactionDT"])
@@ -196,24 +188,49 @@ def preprocess_raw_to_features(
 
 
 def align_and_scale(df_feat: pd.DataFrame, feature_input_cols: list[str], scaler) -> np.ndarray:
-    # Create missing columns (safe default = 0.0)
     for c in feature_input_cols:
         if c not in df_feat.columns:
             df_feat[c] = 0.0
 
     X = df_feat[feature_input_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values.astype(np.float32)
-    Xs = scaler.transform(X)
-    return Xs
+    return scaler.transform(X)
+
+
+def flag_top_percent(probs: np.ndarray, top_percent: float) -> tuple[np.ndarray, float]:
+    """
+    Flag the top `top_percent` fraction (e.g., 5.0 -> top 5%).
+    Returns:
+      flags: 0/1 array
+      cutoff: probability cutoff used
+    """
+    if len(probs) == 0:
+        return np.array([], dtype=int), float("nan")
+
+    top_percent = float(top_percent)
+    top_percent = max(0.0, min(100.0, top_percent))
+
+    if top_percent <= 0.0:
+        cutoff = float("inf")
+        flags = np.zeros_like(probs, dtype=int)
+        return flags, cutoff
+
+    if top_percent >= 100.0:
+        cutoff = float("-inf")
+        flags = np.ones_like(probs, dtype=int)
+        return flags, cutoff
+
+    cutoff = float(np.quantile(probs, 1.0 - (top_percent / 100.0)))
+    # Use >= so you never flag fewer than intended when many equal the cutoff
+    flags = (probs >= cutoff).astype(int)
+    return flags, cutoff
 
 
 def build_compact_output(df_raw: pd.DataFrame, probs: np.ndarray, flags: np.ndarray, var: np.ndarray | None = None):
     out = pd.DataFrame()
 
-    # Prefer to include TransactionID (unique identifier)
     if "TransactionID" in df_raw.columns:
         out["TransactionID"] = df_raw["TransactionID"]
 
-    # Add a small set of human-readable fields for demo (only if present)
     for c in ["TransactionDT", "TransactionAmt", "ProductCD", "card1", "card4", "DeviceType"]:
         if c in df_raw.columns:
             out[c] = df_raw[c]
@@ -230,7 +247,7 @@ def build_compact_output(df_raw: pd.DataFrame, probs: np.ndarray, flags: np.ndar
 # UI
 # =========================
 st.set_page_config(page_title="Fraud Detection (CSV)", layout="wide")
-st.title("Fraud Detection using Deep Learning — CSV Uploader (Compact Output)")
+st.title("Fraud Detection using Deep Learning — CSV Uploader (Top % Flagging)")
 
 config, feature_input_cols, te, scaler, pca, medians, target_mean, card_stats, model = load_artifacts()
 
@@ -238,7 +255,10 @@ with st.sidebar:
     st.header("Options")
     use_mc = st.checkbox("Compute uncertainty (MC Dropout)", value=False)
     T = st.slider("MC samples (T)", 5, 50, int(config.get("mc_dropout_T", 20)))
-    threshold = st.slider("Flag threshold", 0.0, 1.0, float(config.get("threshold", 0.5)), 0.01)
+
+    # Top-percent flagging control (Option 1)
+    top_percent = st.slider("Flag top (%)", 0.0, 50.0, float(config.get("flag_top_percent", 5.0)), 0.5)
+    st.caption("Flags the highest-risk X% of rows in the uploaded CSV (capacity-based).")
     st.caption(f"Artifacts loaded from: {ART_DIR}")
 
 uploaded = st.file_uploader(
@@ -252,50 +272,52 @@ if uploaded is None:
 
 df_raw = pd.read_csv(uploaded)
 
-# Show a small preview of input (optional)
 st.subheader("Input preview")
 preview_cols = [c for c in ["TransactionID", "TransactionDT", "TransactionAmt", "ProductCD", "card1", "card4", "DeviceType"] if c in df_raw.columns]
 st.dataframe(df_raw[preview_cols].head(20) if preview_cols else df_raw.head(10), use_container_width=True)
 
 try:
-    # Preprocess -> align -> scale
     df_feat = preprocess_raw_to_features(df_raw, te, pca, medians, target_mean, card_stats)
     Xs = align_and_scale(df_feat, feature_input_cols, scaler)
     Xt = torch.tensor(Xs, dtype=torch.float32)
 
-    # Predict
     if use_mc:
         probs, var = mc_predict(model, Xt, T=T)
-        flags = (probs >= threshold).astype(int)
+        flags, cutoff = flag_top_percent(probs, top_percent)
         out_compact = build_compact_output(df_raw, probs, flags, var=var)
     else:
         with torch.no_grad():
             probs = torch.sigmoid(model(Xt)).numpy().reshape(-1)
-        flags = (probs >= threshold).astype(int)
+        flags, cutoff = flag_top_percent(probs, top_percent)
         out_compact = build_compact_output(df_raw, probs, flags, var=None)
 
-    # Display compact output
-    st.subheader("Predictions (compact)")
-    st.dataframe(out_compact.head(50), use_container_width=True)
-
-    # Summary
     st.subheader("Summary")
     st.write(
         {
             "rows": int(len(out_compact)),
+            "flag_top_percent": float(top_percent),
+            "cutoff_probability_used": float(cutoff) if np.isfinite(cutoff) else str(cutoff),
             "flagged": int(out_compact["fraud_flag"].sum()),
-            "flagged_percent": float(100.0 * out_compact["fraud_flag"].mean()),
-            "threshold": float(threshold),
+            "flagged_percent_actual": float(100.0 * out_compact["fraud_flag"].mean()),
         }
     )
 
-    # Download compact CSV only
+    st.subheader("Predictions (compact)")
+    st.dataframe(out_compact.head(50), use_container_width=True)
+
+    st.subheader("Top 20 highest-risk transactions")
+    st.dataframe(out_compact.sort_values("fraud_probability", ascending=False).head(20), use_container_width=True)
+
     st.download_button(
         "Download predictions CSV (compact)",
         data=out_compact.to_csv(index=False).encode("utf-8"),
         file_name="predictions_compact.csv",
         mime="text/csv",
     )
+
+except Exception as e:
+    st.error(f"Inference failed: {e}")
+    st.stop()
 
 except Exception as e:
     st.error(f"Inference failed: {e}")
