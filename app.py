@@ -335,18 +335,18 @@ def page_overview() -> None:
         st.markdown(
             """
             **Traditional ML:**
-            - 🌳 XGBoost — incremental learning + ADWIN drift detection
-            - 🌲 Random Forest — balanced class weights
-            - 📉 Logistic Regression — L1 regularization
-            - ⚡ LightGBM
+            - XGBoost — incremental learning + ADWIN drift detection
+            - Random Forest — balanced class weights
+            - Logistic Regression — L1 regularization
+            - LightGBM
 
             **Deep Learning:**
-            - 🧠 ImprovedMLP: 256→128→64→32→1
+            - MLP: 256→128→64→32→1
               - MC-Dropout for uncertainty estimation
               - Focal Loss for class imbalance (α=0.25, γ=2.0)
 
             **Ensemble:**
-            - 🎯 0.6 × XGBoost + 0.4 × MLP
+            - 0.6 × XGBoost + 0.4 × MLP
             """
         )
 
@@ -366,7 +366,7 @@ def page_overview() -> None:
             """
         )
 
-    st.subheader("🏗️ Architecture & Approach")
+    st.subheader("Architecture & Approach")
     col3, col4 = st.columns(2)
     with col3:
         st.markdown(
@@ -688,7 +688,8 @@ def page_live_prediction() -> None:
                         artifacts["card_stats"],
                     )
                     Xs = align_and_scale(df_feat, artifacts["feature_input_cols"], artifacts["scaler"])
-                    xgb_probs = xgb_model.predict(xgb.DMatrix(Xs))
+X_df = pd.DataFrame(Xs, columns=artifacts["feature_input_cols"])
+xgb_probs = xgb_model.predict(xgb.DMatrix(X_df, feature_names=artifacts["feature_input_cols"]))
             except Exception as xe:
                 st.warning(f"XGBoost inference failed: {xe}")
 
