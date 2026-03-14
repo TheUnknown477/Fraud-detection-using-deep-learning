@@ -688,8 +688,8 @@ def page_live_prediction() -> None:
                         artifacts["card_stats"],
                     )
                     Xs = align_and_scale(df_feat, artifacts["feature_input_cols"], artifacts["scaler"])
-X_df = pd.DataFrame(Xs, columns=artifacts["feature_input_cols"])
-xgb_probs = xgb_model.predict(xgb.DMatrix(X_df, feature_names=artifacts["feature_input_cols"]))
+                    X_df = pd.DataFrame(Xs, columns=artifacts["feature_input_cols"])
+                    xgb_probs = xgb_model.predict(xgb.DMatrix(X_df, feature_names=artifacts["feature_input_cols"]))
             except Exception as xe:
                 st.warning(f"XGBoost inference failed: {xe}")
 
@@ -872,10 +872,8 @@ def page_single_transaction() -> None:
                         artifacts["card_stats"],
                     )
                     Xs = align_and_scale(df_feat, artifacts["feature_input_cols"], artifacts["scaler"])
-X_df = pd.DataFrame(Xs, columns=artifacts["feature_input_cols"])
-xgb_prob = float(
-    xgb_model.predict(xgb.DMatrix(X_df, feature_names=artifacts["feature_input_cols"]))[0]
-)
+                    X_df = pd.DataFrame(Xs, columns=artifacts["feature_input_cols"])
+                    xgb_prob = float(xgb_model.predict(xgb.DMatrix(X_df, feature_names=artifacts["feature_input_cols"]))[0])
 
                     xgb_risk_label, xgb_risk_type = _risk_level(xgb_prob)
                     st.markdown("### 🌳 XGBoost (Traditional ML)")
