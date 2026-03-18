@@ -360,7 +360,7 @@ def page_overview() -> None:
     st.title("Project Overview")
     st.markdown(
         """
-        ## Adaptive Credit Card Fraud Detection
+        ## Credit Card Fraud Detection
         ### IEEE-CIS Fraud Detection Dataset
 
         This dashboard showcases a comprehensive comparison of **Traditional Machine Learning** vs.
