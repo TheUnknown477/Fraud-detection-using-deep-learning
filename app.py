@@ -77,9 +77,10 @@ def initialize_data() -> None:
 
 def render_kpis(df: pd.DataFrame) -> None:
     """Render top KPI metrics."""
-    pending_count = int((df["Status"] == "Pending Review").sum())
+    pending_mask = df["Status"] == "Pending Review"
+    pending_count = int(pending_mask.sum())
     auto_approved_count = int((df["Status"] == "Auto-Approved").sum())
-    total_value_at_risk = float(df.loc[df["Status"] == "Pending Review", "Amount"].sum())
+    total_value_at_risk = float(df.loc[pending_mask, "Amount"].sum())
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Pending High Risk Alerts", pending_count)
