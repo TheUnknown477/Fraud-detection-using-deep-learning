@@ -107,6 +107,47 @@ Results show that the full method (delay‑aware, drift‑triggered, uncertainty
    - Install dependencies: `pip install flask xgboost scikit-learn joblib`.[9][10]
    - Run `python app.py` and open `http://127.0.0.1:5000/`.
 
+---
+
+## 🚀 Analyst Dashboard (Static In-App Scoring)
+
+The `app.py` Streamlit dashboard runs fully locally with no external services
+required. Transactions are entered in the UI and scored on the spot using a
+local scoring function. All data is stored in-memory for the current session.
+
+### Local run
+
+#### 1. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+#### 2. (Optional) Add your trained model
+
+Place `stacked_hybrid.pkl` (or set `MODEL_PATH` env var) in the repository
+root. When present the app loads it automatically for inference. Without it
+the app uses a deterministic rule-based fallback scorer so it works out of
+the box.
+
+#### 3. Run the Streamlit dashboard
+
+```bash
+streamlit run app.py
+```
+
+Open http://localhost:8501 in your browser.
+
+#### 4. Add transactions
+
+- Use the **"➕ Add New Transaction (Test / Demo)"** expander in the dashboard
+  to create transactions.
+- Each submission is scored immediately in the app and added to the queue.
+- Select a row in the queue, then click **Confirm Fraud & Block** or
+  **Mark as Safe** to update its status.
+
+---
+
 ***
 
 ## Academic Use

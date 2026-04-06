@@ -1,823 +1,383 @@
-# -*- coding: utf-8 -*-
-"""Fraud Detection Dashboard — Simple, Human-in-the-Loop Streamlit App
-
-Designed for non-technical users:
-- Clear language
-- Guided actions
-- Confidence/uncertainty signaling
-- Manual review queue
-- Explainability panel
-"""
+"""Credit Card Fraud Detection Analyst Dashboard."""
 
 from __future__ import annotations
 
-import json
 import os
-import pickle
+import uuid
+from datetime import datetime
 from pathlib import Path
-import sys
-from typing import Optional, Any
+from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
-from pandas.errors import ParserError
 import streamlit as st
-import torch
-import torch.nn as nn
 
-# -------------------------
-# Runtime environment helper
-# -------------------------
-def _ensure_workspace_venv() -> None:
-    """Relaunch with .venv interpreter when started from another environment."""
-    app_path = Path(__file__).resolve()
-    repo_dir = app_path.parent
-    venv_python = repo_dir / ".venv" / "bin" / "python"
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-    if os.environ.get("FRAUD_APP_VENV_REEXEC") == "1":
-        return
-    if not venv_python.exists():
-        return
+_MODEL_PATH = Path(os.getenv("MODEL_PATH", "stacked_hybrid.pkl"))
+_HIGH_RISK_THRESHOLD = 75.0  # risk_score >= this → Pending Review
 
-    current_python = Path(sys.executable).resolve()
-    if current_python == venv_python.resolve():
-        return
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
 
-    os.environ["FRAUD_APP_VENV_REEXEC"] = "1"
-    os.execv(
-        str(venv_python),
-        [str(venv_python), "-m", "streamlit", "run", str(app_path), *sys.argv[1:]],
-    )
+_model: Any = None
 
 
-_ensure_workspace_venv()
-
-# -------------------------
-# Optional dependencies
-# -------------------------
-try:
-    import joblib
-except ImportError:
-    class _JoblibCompat:
-        @staticmethod
-        def load(path):
-            with open(path, "rb") as f:
-                return pickle.load(f)
-    joblib = _JoblibCompat()
-
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-    HAS_PLOTLY = True
-except ImportError:
-    HAS_PLOTLY = False
-
-# -------------------------
-# Paths
-# -------------------------
-REPO_DIR = Path(__file__).parent
-LOCAL_ART_DIR = REPO_DIR / "results"
-COLAB_ART_DIR = Path("/content/drive/MyDrive/Colab_Notebooks/fraud_app/results")
-FEEDBACK_DIR = REPO_DIR / "feedback"
-FEEDBACK_DIR.mkdir(exist_ok=True)
-
-
-def _resolve_art_dir() -> Path:
-    if LOCAL_ART_DIR.exists():
-        return LOCAL_ART_DIR
-    if COLAB_ART_DIR.exists():
-        return COLAB_ART_DIR
-    return LOCAL_ART_DIR
-
-
-ART_DIR = _resolve_art_dir()
-
-
-# -------------------------
-# Model definition
-# -------------------------
-class ImprovedMLP(nn.Module):
-    def __init__(self, input_dim: int):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.fc4 = nn.Linear(64, 32)
-        self.fc5 = nn.Linear(32, 1)
-        self.dropout = nn.Dropout(0.3)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        x = self.dropout(self.relu(self.fc1(x)))
-        x = self.dropout(self.relu(self.fc2(x)))
-        x = self.dropout(self.relu(self.fc3(x)))
-        x = self.dropout(self.relu(self.fc4(x)))
-        return self.fc5(x)
-
-
-def mc_predict(model: nn.Module, X: torch.Tensor, T: int = 20):
-    """MC Dropout prediction: returns mean probability and variance."""
-    model.eval()
-    for m in model.modules():
-        if isinstance(m, nn.Dropout):
-            m.train()
-
-    probs = []
-    with torch.no_grad():
-        for _ in range(T):
-            logits = model(X)
-            probs.append(torch.sigmoid(logits).cpu().numpy())
-
-    probs = np.stack(probs, axis=0)
-    model.eval()
-    return probs.mean(axis=0).reshape(-1), probs.var(axis=0).reshape(-1)
-
-
-# -------------------------
-# Artifact loading
-# -------------------------
-@st.cache_resource
-def load_artifacts() -> tuple[Optional[dict], Optional[str]]:
-    """Load MLP artifacts. Returns (artifact_dict, error)."""
-    try:
-        mlp_path = ART_DIR / "mlp_state_dict.pt"
-        if not mlp_path.exists():
-            return None, f"MLP model not found at: {mlp_path}"
-
-        feature_input_cols = joblib.load(ART_DIR / "feature_input_cols.pkl")
-        te = joblib.load(ART_DIR / "target_encoder.pkl")
-        scaler = joblib.load(ART_DIR / "scaler.pkl")
-        pca = joblib.load(ART_DIR / "pca.pkl")
-
-        with open(ART_DIR / "target_mean.json", "r") as f:
-            target_mean = json.load(f)["target_mean"]
-
-        medians: dict = {}
-        medians_path = ART_DIR / "medians.json"
-        if medians_path.exists():
-            with open(medians_path, "r") as f:
-                medians = json.load(f)
-
-        card_stats: dict = {}
-        for card_col in ["card1", "card2", "card3"]:
-            p = ART_DIR / f"{card_col}_stats.parquet"
-            if p.exists():
-                card_stats[card_col] = pd.read_parquet(p)
-
-        config: dict = {}
-        config_path = ART_DIR / "config.json"
-        if config_path.exists():
-            with open(config_path, "r") as f:
-                config = json.load(f)
-
-        model = ImprovedMLP(input_dim=len(feature_input_cols))
-        state = torch.load(mlp_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state)
-        model.eval()
-
-        return {
-            "config": config,
-            "feature_input_cols": feature_input_cols,
-            "te": te,
-            "scaler": scaler,
-            "pca": pca,
-            "medians": medians,
-            "target_mean": target_mean,
-            "card_stats": card_stats,
-            "model": model,
-        }, None
-    except Exception as e:
-        return None, str(e)
-
-
-@st.cache_resource
-def load_xgb_model() -> tuple[Optional[object], Optional[str]]:
-    """Load XGBoost model if available. Returns (model, error)."""
-    try:
-        import xgboost as xgb
-
-        model_path = ART_DIR / "xgb_model.json"
-        if not model_path.exists():
-            return None, f"XGBoost model file not found at: {model_path}"
-
-        booster = xgb.Booster()
-        booster.load_model(str(model_path))
-        return booster, None
-    except ImportError:
-        return None, "xgboost is not installed"
-    except Exception as e:
-        return None, str(e)
-
-
-# -------------------------
-# Preprocessing
-# -------------------------
-def preprocess_raw_to_features(
-    df_raw: pd.DataFrame,
-    te,
-    pca,
-    medians: dict,
-    target_mean: float,
-    card_stats: dict,
-) -> pd.DataFrame:
-    df = df_raw.copy()
-
-    required = ["TransactionDT", "TransactionAmt"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-
-    # Time features
-    df["TransactionHour"] = (df["TransactionDT"] // 3600) % 24
-    df["TransactionDay"] = df["TransactionDT"] // (3600 * 24)
-    df["TransactionDayOfWeek"] = df["TransactionDay"] % 7
-
-    # Amount features
-    df["TransactionAmt_log"] = np.log1p(df["TransactionAmt"])
-    df["TransactionAmt_decimal"] = df["TransactionAmt"] - np.floor(df["TransactionAmt"])
-    df["TransactionAmt_rounded"] = (df["TransactionAmt"] == np.round(df["TransactionAmt"])).astype(int)
-
-    # Categorical fill
-    cat_cols = ["ProductCD", "card4", "card6", "DeviceType", "P_emaildomain", "R_emaildomain", "DeviceInfo"]
-    for c in cat_cols:
-        if c in df.columns:
-            df[c] = df[c].astype("object").fillna("missing")
-
-    # Numeric fill
-    for col, med in medians.items():
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(med)
-
-    # Target encode
-    present_cat = [c for c in cat_cols if c in df.columns]
-    if present_cat:
-        df[present_cat] = te.transform(df[present_cat])
-
-    # Card stats
-    for card_col in ["card1", "card2", "card3"]:
-        if card_col in df.columns and card_col in card_stats:
-            stats = card_stats[card_col]
-            df = df.merge(stats, on=card_col, how="left")
-            df[f"{card_col}_fraud_rate"] = df[f"{card_col}_fraud_rate"].fillna(target_mean)
-            df[f"{card_col}_count"] = df[f"{card_col}_count"].fillna(0)
-
-    # PCA on V columns
-    v_cols = [c for c in df.columns if c.startswith("V")]
-    if not v_cols:
-        raise ValueError("No V* columns found. Upload must include V1..V339.")
-
-    def v_key(c):
+def _load_model() -> Any:
+    """Try to load a saved model artifact; return None if unavailable."""
+    if _MODEL_PATH.exists():
         try:
-            return int(c[1:])
+            return joblib.load(_MODEL_PATH)
         except Exception:
-            return 10**9
-
-    v_cols = sorted(v_cols, key=v_key)
-    Xv_df = df[v_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    Xv = Xv_df.values.astype(np.float32)
-    Xv_pca = pca.transform(Xv)
-    for i in range(Xv_pca.shape[1]):
-        df[f"V_pca_{i}"] = Xv_pca[:, i]
-
-    df = df.drop(columns=v_cols)
-    if "TransactionDT" in df.columns:
-        df = df.drop(columns=["TransactionDT"])
-
-    return df
+            return None
+    return None
 
 
-def align_and_scale(df_feat: pd.DataFrame, feature_input_cols: list[str], scaler) -> np.ndarray:
-    for c in feature_input_cols:
-        if c not in df_feat.columns:
-            df_feat[c] = 0.0
-    X = df_feat[feature_input_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values.astype(np.float32)
-    return scaler.transform(X)
+_model = _load_model()
+
+# ---------------------------------------------------------------------------
+# Local scoring
+# ---------------------------------------------------------------------------
 
 
-def run_mlp_inference(
-    artifacts: dict,
-    df_raw: pd.DataFrame,
-    use_mc: bool = True,
-    T: int = 20,
-) -> tuple[np.ndarray, np.ndarray | None]:
-    df_feat = preprocess_raw_to_features(
-        df_raw,
-        artifacts["te"],
-        artifacts["pca"],
-        artifacts["medians"],
-        artifacts["target_mean"],
-        artifacts["card_stats"],
-    )
-    Xs = align_and_scale(df_feat, artifacts["feature_input_cols"], artifacts["scaler"])
-    Xt = torch.tensor(Xs, dtype=torch.float32)
+def _fallback_score(payload: dict) -> tuple[float, list[str]]:
+    """Deterministic rule-based fallback scorer (no model required)."""
+    amount = float(payload.get("amount", 0))
+    velocity_1h = int(payload.get("velocity_1h", 0))
+    geo_distance_km = float(payload.get("geo_distance_km", 0.0))
+    device_new = int(payload.get("device_new", 0))
 
-    if use_mc:
-        return mc_predict(artifacts["model"], Xt, T=T)
+    prob = 0.05
+    reasons: list[str] = []
 
-    with torch.no_grad():
-        probs = torch.sigmoid(artifacts["model"](Xt)).numpy().reshape(-1)
-    return probs, None
+    if amount > 50_000:
+        prob += 0.40
+        reasons.append("Very high transaction amount")
+    elif amount > 10_000:
+        prob += 0.20
+        reasons.append("High transaction amount")
+    elif amount > 5_000:
+        prob += 0.10
+        reasons.append("Elevated transaction amount")
 
+    if velocity_1h >= 5:
+        prob += 0.30
+        reasons.append("High velocity (≥5 txns/h)")
+    elif velocity_1h >= 3:
+        prob += 0.15
+        reasons.append("Elevated velocity (≥3 txns/h)")
 
-# -------------------------
-# UI helpers
-# -------------------------
+    if geo_distance_km > 500:
+        prob += 0.25
+        reasons.append("Transaction far from home location")
+    elif geo_distance_km > 100:
+        prob += 0.10
+        reasons.append("Transaction away from usual area")
 
-def fmt_pct(score: float, decimals: int = 1) -> str:
-    """Format a [0, 1] probability/metric score as a percentage string for display.
+    if device_new:
+        prob += 0.15
+        reasons.append("New/unrecognised device")
 
-    Internal model calculations remain in [0, 1]; this helper is used only for
-    user-facing outputs (tables, metrics widgets, printed summaries, etc.).
-
-    Examples:
-        fmt_pct(0.82)      -> "82.0%"
-        fmt_pct(0.5)       -> "50.0%"   (threshold 0.5 == 50%)
-        fmt_pct(0.034, 2)  -> "3.40%"
-    """
-    return f"{score * 100:.{decimals}f}%"
-
-
-def risk_band(prob: float) -> str:
-    """Classify a [0, 1] fraud probability into a risk band label.
-
-    Thresholds are kept in [0, 1] for internal comparisons; displayed
-    equivalents are 20% / 50% / 75%.
-    """
-    # Internal thresholds: 0.20 (20%), 0.50 (50%), 0.75 (75%)
-    if prob < 0.20:
-        return "Low"
-    if prob < 0.50:
-        return "Medium"
-    if prob < 0.75:
-        return "High"
-    return "Critical"
-
-
-def action_recommendation(prob: float, uncertain: bool) -> str:
-    """Return a recommended action for a transaction.
-
-    prob is a [0, 1] fraud probability (internal scale).
-    Displayed thresholds: 20% approve, 50% manual review, above 50% block.
-    """
-    # Internal thresholds: 0.20 (20%), 0.50 (50%)
-    if uncertain:
-        return "Send for manual review"
-    if prob < 0.20:
-        return "Approve"
-    if prob < 0.50:
-        return "Manual review"
-    return "Block"
-
-
-def confidence_label(var_value: float | None) -> str:
-    """Convert MC-Dropout variance to a human-readable confidence label.
-
-    Variance thresholds are kept in their native scale (not converted to %).
-    """
-    if var_value is None:
-        return "Not available"
-    if var_value < 0.010:
-        return "High"
-    if var_value < 0.050:
-        return "Medium"
-    return "Low"
-
-
-def explain_transaction(row: pd.Series) -> list[str]:
-    reasons = []
-
-    amt = float(row.get("TransactionAmt", 0))
-    if amt > 1000:
-        reasons.append("Transaction amount is relatively high.")
-
-    hour = int((row.get("TransactionDT", 0) // 3600) % 24) if "TransactionDT" in row else 12
-    if hour <= 5 or hour >= 23:
-        reasons.append("Transaction time is outside typical daytime hours.")
-
-    if str(row.get("DeviceType", "missing")).lower() in {"missing", "mobile"}:
-        reasons.append("Device pattern is less consistent with known low-risk behavior.")
-
-    if str(row.get("card4", "")).lower() in {"discover", "american express"}:
-        reasons.append("Card network pattern is less common in this dataset profile.")
-
+    prob = min(prob, 0.99)
     if not reasons:
-        reasons.append("No single factor dominates; decision comes from combined pattern signals.")
-    return reasons[:4]
+        reasons = ["No significant risk flags"]
+
+    return prob, reasons
 
 
-def ensure_session_state() -> None:
-    if "review_queue" not in st.session_state:
-        st.session_state.review_queue = pd.DataFrame()
-    if "review_history" not in st.session_state:
-        st.session_state.review_history = pd.DataFrame(columns=[
-            "TransactionID",
-            "risk_score",
-            "risk_band",
-            "recommended_action",
-            "review_decision",
-            "review_notes",
-            "reviewer",
-            "timestamp",
-        ])
+def _score_with_model(payload: dict, model: Any) -> tuple[float, list[str]]:
+    """Run inference using the loaded model artifact."""
+    features = [
+        float(payload.get("amount", 0)),
+        int(payload.get("velocity_1h", 0)),
+        float(payload.get("geo_distance_km", 0.0)),
+        int(payload.get("device_new", 0)),
+    ]
+    X = np.array(features, dtype=float).reshape(1, -1)
+    prob = float(model.predict_proba(X)[0, 1])
+    reasons = [f"Model score: {prob * 100:.1f}"]
+    return prob, reasons
 
 
-def add_to_review_queue(df: pd.DataFrame) -> None:
-    ensure_session_state()
-    if st.session_state.review_queue.empty:
-        st.session_state.review_queue = df.copy()
+def score_transaction(payload: dict) -> dict:
+    """Score a transaction locally and return risk_score, decision, reason_codes."""
+    if _model is not None:
+        try:
+            prob, reasons = _score_with_model(payload, _model)
+        except Exception:
+            prob, reasons = _fallback_score(payload)
     else:
-        merged = pd.concat([st.session_state.review_queue, df], ignore_index=True)
-        if "TransactionID" in merged.columns:
-            merged = merged.drop_duplicates(subset=["TransactionID"], keep="last")
-        st.session_state.review_queue = merged
+        prob, reasons = _fallback_score(payload)
+
+    risk_score = round(prob * 100, 2)
+    decision = "Pending Review" if risk_score >= _HIGH_RISK_THRESHOLD else "Auto-Approved"
+    return {
+        "transaction_id": payload.get("id", ""),
+        "risk_score": risk_score,
+        "decision": decision,
+        "reason_codes": reasons,
+    }
 
 
-def save_feedback_csv() -> Path:
-    ensure_session_state()
-    out_path = FEEDBACK_DIR / "manual_review_feedback.csv"
-    st.session_state.review_history.to_csv(out_path, index=False)
-    return out_path
+# ---------------------------------------------------------------------------
+# Session-state data helpers
+# ---------------------------------------------------------------------------
+
+_SEED_TRANSACTIONS = [
+    {
+        "ID": "TXN-SEED-001",
+        "Amount": 48500.0,
+        "Merchant": "ElectroMart",
+        "Location": "Delhi, DL",
+        "Risk Score": 88.0,
+        "Status": "Pending Review",
+        "Context": "Very high transaction amount; High velocity (≥5 txns/h)",
+        "Created At": datetime(2024, 1, 15, 10, 23),
+    },
+    {
+        "ID": "TXN-SEED-002",
+        "Amount": 1200.0,
+        "Merchant": "Swiggy",
+        "Location": "Bengaluru, KA",
+        "Risk Score": 12.0,
+        "Status": "Auto-Approved",
+        "Context": "No significant risk flags",
+        "Created At": datetime(2024, 1, 15, 10, 25),
+    },
+    {
+        "ID": "TXN-SEED-003",
+        "Amount": 15000.0,
+        "Merchant": "JewelHouse",
+        "Location": "Mumbai, MH",
+        "Risk Score": 79.0,
+        "Status": "Pending Review",
+        "Context": "High transaction amount; New/unrecognised device",
+        "Created At": datetime(2024, 1, 15, 10, 31),
+    },
+]
 
 
-# -------------------------
-# Pages
-# -------------------------
-def page_home() -> None:
-    st.title("Fraud Detection Dashboard")
-    st.write("This system helps teams screen transactions, review uncertain cases, and record final decisions.")
+def _init_session_state() -> None:
+    """Initialise session-state keys on first run."""
+    if "transactions_df" not in st.session_state:
+        st.session_state.transactions_df = pd.DataFrame(_SEED_TRANSACTIONS)
+    if "selected_index" not in st.session_state:
+        st.session_state.selected_index = None
 
-    st.subheader("How to use this dashboard")
-    st.markdown(
-        """
-        1. Go to **Transaction Screening** and upload a CSV file.
-        2. Review high-risk or uncertain transactions in **Manual Review Queue**.
-        3. Save investigator decisions to improve future model updates.
-        """
+
+def update_transaction_status(txn_id: str, new_status: str) -> bool:
+    """Update a transaction's status in session state. Returns True on success."""
+    df: pd.DataFrame = st.session_state.transactions_df
+    mask = df["ID"] == txn_id
+    if not mask.any():
+        return False
+    st.session_state.transactions_df.loc[mask, "Status"] = new_status
+    return True
+
+
+def insert_transaction(txn: dict, score_resp: dict) -> bool:
+    """Append a newly scored transaction to the session-state DataFrame."""
+    new_row = {
+        "ID": txn["id"],
+        "Amount": float(txn["amount"]),
+        "Merchant": txn["merchant"],
+        "Location": txn["location"],
+        "Risk Score": float(score_resp["risk_score"]),
+        "Status": score_resp["decision"],
+        "Context": ", ".join(score_resp.get("reason_codes", [])) or "No flags",
+        "Created At": datetime.now(),
+    }
+    new_df = pd.DataFrame([new_row])
+    st.session_state.transactions_df = pd.concat(
+        [new_df, st.session_state.transactions_df], ignore_index=True
     )
+    return True
 
-    st.subheader("Core workflow")
+
+# ---------------------------------------------------------------------------
+# UI sections
+# ---------------------------------------------------------------------------
+
+
+def render_kpis(df: pd.DataFrame) -> None:
+    """Render top KPI metrics."""
+    if df.empty or "Status" not in df.columns:
+        pending_count = 0
+        auto_approved_count = 0
+        total_value_at_risk = 0.0
+    else:
+        pending_mask = df["Status"] == "Pending Review"
+        pending_count = int(pending_mask.sum())
+        auto_approved_count = int((df["Status"] == "Auto-Approved").sum())
+        total_value_at_risk = (
+            float(df.loc[pending_mask, "Amount"].sum()) if pending_count > 0 else 0.0
+        )
+
     col1, col2, col3 = st.columns(3)
-    col1.info("Screen transactions with risk scores.")
-    col2.info("Prioritize uncertain and high-risk cases.")
-    col3.info("Capture final decisions as feedback.")
-
-    st.subheader("Model summary")
-    st.table(pd.DataFrame({
-        "Engine": ["Pattern Engine (XGBoost)", "Deep Learning Engine (MLP)", "Combined Engine"],
-        "Purpose": [
-            "Detects structured fraud patterns",
-            "Finds complex hidden behavior",
-            "Combines both for final prioritization",
-        ],
-    }))
+    col1.metric("Pending High Risk Alerts", pending_count)
+    col2.metric("Auto-Approved", auto_approved_count)
+    col3.metric("Total Value at Risk", f"₹{total_value_at_risk:,.2f}")
 
 
-def page_transaction_screening() -> None:
-    st.title("Transaction Screening")
-    st.write("Upload transaction data. The system will score each transaction and suggest what to do next.")
+def render_alert_queue(df: pd.DataFrame) -> int | None:
+    """Render transaction queue table and return selected row index."""
+    st.subheader("The Analyst Alert Queue")
 
-    artifacts, art_err = load_artifacts()
-    xgb_model, xgb_err = load_xgb_model()
+    if df.empty:
+        st.info("No transactions found. Use the form below to add transactions.")
+        return None
 
-    if artifacts is None:
-        st.error(f"Model artifacts are not available: {art_err}")
-        return
+    display_cols = ["ID", "Amount", "Merchant", "Location", "Risk Score", "Status", "Context"]
+    display_df = df[[c for c in display_cols if c in df.columns]]
 
-    with st.expander("Screening settings", expanded=True):
-        col1, col2, col3 = st.columns(3)
-        top_percent = col1.slider("Flag top risk percent", 1.0, 50.0, 5.0, 0.5)
-        uncertainty_threshold = col2.slider("Uncertainty threshold", 0.005, 0.100, 0.030, 0.001)
-        mc_passes = col3.slider("Confidence passes", 5, 50, 20)
-
-    uploaded = st.file_uploader("Upload CSV file", type=["csv"], key="screen_upload")
-    if uploaded is None:
-        st.info("Please upload a CSV file to begin.")
-        return
-
-    try:
-        df_raw = pd.read_csv(uploaded)
-    except ParserError as pe:
-        st.error("The CSV file format appears invalid.")
-        st.code(str(pe))
-        return
-    except Exception as e:
-        st.error(f"File could not be read: {e}")
-        return
-
-    st.subheader("Data preview")
-    st.dataframe(df_raw.head(20), use_container_width=True)
-
-    try:
-        with st.spinner("Running fraud screening..."):
-            mlp_probs, mlp_var = run_mlp_inference(artifacts, df_raw, use_mc=True, T=mc_passes)
-
-        xgb_probs = None
-        if xgb_model is not None:
-            try:
-                import xgboost as xgb
-                df_feat = preprocess_raw_to_features(
-                    df_raw,
-                    artifacts["te"],
-                    artifacts["pca"],
-                    artifacts["medians"],
-                    artifacts["target_mean"],
-                    artifacts["card_stats"],
-                )
-                Xs = align_and_scale(df_feat, artifacts["feature_input_cols"], artifacts["scaler"])
-                X_df = pd.DataFrame(Xs, columns=artifacts["feature_input_cols"])
-                xgb_probs = xgb_model.predict(xgb.DMatrix(X_df, feature_names=artifacts["feature_input_cols"]))
-            except Exception as xe:
-                st.warning(f"Pattern engine unavailable for this run: {xe}")
-        elif xgb_err:
-            st.warning(f"Pattern engine not loaded: {xgb_err}")
-
-        if xgb_probs is not None:
-            combined = 0.6 * xgb_probs + 0.4 * mlp_probs
-        else:
-            combined = mlp_probs
-
-        cutoff = float(np.quantile(combined, 1 - top_percent / 100.0))
-        flagged = combined >= cutoff
-        uncertain = (mlp_var is not None) & (mlp_var >= uncertainty_threshold)
-
-        out = pd.DataFrame()
-        out["TransactionID"] = df_raw["TransactionID"] if "TransactionID" in df_raw.columns else np.arange(len(df_raw))
-        out["TransactionAmt"] = df_raw["TransactionAmt"] if "TransactionAmt" in df_raw.columns else np.nan
-        out["risk_score"] = combined
-        out["risk_band"] = [risk_band(v) for v in combined]
-        out["mlp_score"] = mlp_probs
-        out["xgb_score"] = xgb_probs if xgb_probs is not None else np.nan
-        out["uncertainty_variance"] = mlp_var if mlp_var is not None else np.nan
-        out["confidence"] = [confidence_label(v if mlp_var is not None else None) for v in (mlp_var if mlp_var is not None else [None]*len(out))]
-        out["uncertain_case"] = uncertain if isinstance(uncertain, np.ndarray) else False
-        out["flagged_top_risk"] = flagged
-        out["recommended_action"] = [
-            action_recommendation(prob=float(p), uncertain=bool(u))
-            for p, u in zip(out["risk_score"].values, out["uncertain_case"].values)
-        ]
-
-        review_candidates = out[(out["flagged_top_risk"]) | (out["uncertain_case"])].copy()
-        add_to_review_queue(review_candidates)
-
-        st.subheader("Summary")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total transactions", len(out))
-        c2.metric("Flagged (top risk)", int(out["flagged_top_risk"].sum()))
-        c3.metric("Uncertain cases", int(out["uncertain_case"].sum()))
-        c4.metric("Manual review queue", len(st.session_state.review_queue))
-
-        st.subheader("Prioritized transactions")
-        # Build a display copy with percentage-formatted score columns (internal out uses [0,1])
-        display_out = out.sort_values("risk_score", ascending=False).head(50).copy()
-        display_out["risk_score"] = display_out["risk_score"].apply(fmt_pct)
-        display_out["mlp_score"] = display_out["mlp_score"].apply(fmt_pct)
-        display_out["xgb_score"] = display_out["xgb_score"].apply(
-            lambda x: fmt_pct(x) if pd.notna(x) else "N/A"
-        )
-        st.dataframe(display_out, use_container_width=True)
-
-        # CSV export — scores in percent for readability
-        export_out = out.copy()
-        export_out["risk_score"] = export_out["risk_score"].apply(fmt_pct)
-        export_out["mlp_score"] = export_out["mlp_score"].apply(fmt_pct)
-        export_out["xgb_score"] = export_out["xgb_score"].apply(
-            lambda x: fmt_pct(x) if pd.notna(x) else "N/A"
-        )
-
-        st.download_button(
-            "Download screening results (CSV)",
-            data=export_out.to_csv(index=False).encode("utf-8"),
-            file_name="screening_results.csv",
-            mime="text/csv",
-        )
-
-    except Exception as e:
-        st.error(f"Screening failed: {e}")
-
-
-def page_case_explanations() -> None:
-    st.title("Case Explanations")
-    st.write("Select one transaction to see a simple explanation of why it was flagged.")
-
-    ensure_session_state()
-    queue = st.session_state.review_queue
-    if queue.empty:
-        st.info("No transactions in the review queue yet. Run Transaction Screening first.")
-        return
-
-    tx_ids = queue["TransactionID"].astype(str).tolist()
-    selected = st.selectbox("Select transaction ID", tx_ids)
-    row = queue[queue["TransactionID"].astype(str) == selected].iloc[0]
-
-    st.subheader("Decision summary")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Risk score", fmt_pct(float(row['risk_score'])))
-    col2.metric("Risk band", str(row["risk_band"]))
-    col3.metric("Recommended action", str(row["recommended_action"]))
-
-    st.subheader("Confidence and uncertainty")
-    col4, col5 = st.columns(2)
-    col4.metric("Confidence", str(row.get("confidence", "Not available")))
-    uv = row.get("uncertainty_variance", np.nan)
-    col5.metric("Uncertainty variance", f"{uv:.5f}" if pd.notna(uv) else "Not available")
-
-    st.subheader("Why this transaction was flagged")
-    reasons = explain_transaction(pd.Series({
-        "TransactionAmt": row.get("TransactionAmt", np.nan),
-        "DeviceType": "missing",
-        "card4": "missing",
-        "TransactionDT": 0,
-    }))
-    for r in reasons:
-        st.write(f"- {r}")
-
-    st.caption("These explanations are guidance signals and should support, not replace, human judgment.")
-
-
-def page_manual_review_queue() -> None:
-    st.title("Manual Review Queue")
-    st.write("Review flagged or uncertain transactions and record final investigator decisions.")
-
-    ensure_session_state()
-    queue = st.session_state.review_queue
-    if queue.empty:
-        st.info("Queue is empty. Screen transactions first.")
-        return
-
-    st.subheader("Pending review items")
-    st.dataframe(
-        queue.sort_values("risk_score", ascending=False),
+    table_event = st.dataframe(
+        display_df,
         use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={
+            "Amount": st.column_config.NumberColumn(
+                "Amount",
+                format="₹%.2f",
+            ),
+            "Risk Score": st.column_config.ProgressColumn(
+                "Risk Score",
+                min_value=0,
+                max_value=100,
+                format="%d",
+            ),
+            "Context": st.column_config.TextColumn("Context", width="large"),
+        },
     )
 
-    st.subheader("Record a review decision")
-    tx_ids = queue["TransactionID"].astype(str).tolist()
-    selected = st.selectbox("Transaction ID", tx_ids, key="review_tx")
-    selected_row = queue[queue["TransactionID"].astype(str) == selected].iloc[0]
-
-    col1, col2 = st.columns(2)
-    reviewer = col1.text_input("Reviewer name", value="Investigator")
-    decision = col2.selectbox("Decision", ["Confirm Fraud", "Mark Legitimate", "Escalate"])
-
-    notes = st.text_area("Review notes", height=120, placeholder="Add investigation notes")
-
-    if st.button("Save decision", use_container_width=True):
-        record = {
-            "TransactionID": selected_row["TransactionID"],
-            "risk_score": selected_row["risk_score"],
-            "risk_band": selected_row["risk_band"],
-            "recommended_action": selected_row["recommended_action"],
-            "review_decision": decision,
-            "review_notes": notes,
-            "reviewer": reviewer,
-            "timestamp": pd.Timestamp.utcnow().isoformat(),
-        }
-        st.session_state.review_history = pd.concat(
-            [st.session_state.review_history, pd.DataFrame([record])],
-            ignore_index=True,
-        )
-
-        st.session_state.review_queue = queue[queue["TransactionID"].astype(str) != selected].copy()
-        st.success("Decision saved and transaction removed from queue.")
-
-    st.subheader("Review history")
-    if st.session_state.review_history.empty:
-        st.caption("No review decisions saved yet.")
-    else:
-        st.dataframe(st.session_state.review_history.sort_values("timestamp", ascending=False), use_container_width=True)
-
-        csv_bytes = st.session_state.review_history.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download review feedback (CSV)",
-            data=csv_bytes,
-            file_name="manual_review_feedback.csv",
-            mime="text/csv",
-        )
-
-        if st.button("Save feedback file to project folder"):
-            path = save_feedback_csv()
-            st.success(f"Feedback saved to: {path}")
+    selected_rows = table_event.selection.get("rows", []) if table_event else []
+    if selected_rows:
+        return int(selected_rows[0])
+    return None
 
 
-def page_alerts_and_notifications() -> None:
-    st.title("Alerts and Notifications")
-    st.write("This section provides a simple operational view of alert volumes and recommended communication triggers.")
-
-    ensure_session_state()
-
-    queue_count = len(st.session_state.review_queue)
-    history = st.session_state.review_history.copy()
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Current queue size", queue_count)
-
-    confirmed_fraud = int((history["review_decision"] == "Confirm Fraud").sum()) if not history.empty else 0
-    escalated = int((history["review_decision"] == "Escalate").sum()) if not history.empty else 0
-    c2.metric("Confirmed fraud cases", confirmed_fraud)
-    c3.metric("Escalated cases", escalated)
-
-    st.subheader("Notification guidance")
-    st.markdown(
-        """
-        - Send administrator alert when a case is marked **Confirm Fraud**.
-        - Send high-priority analyst alert when a case is **Escalate**.
-        - Optionally notify customer support for customer communication workflows.
-        """
-    )
-
-    if not history.empty:
-        st.subheader("Recent confirmed/escalated outcomes")
-        alert_df = history[history["review_decision"].isin(["Confirm Fraud", "Escalate"])].copy()
-        st.dataframe(alert_df.sort_values("timestamp", ascending=False).head(50), use_container_width=True)
-
-
-def page_system_health() -> None:
-    st.title("System Health")
-    st.write("This page shows model performance summaries for monitoring.")
-
-    metrics_path = ART_DIR / "metrics_comparison.json"
-    if not metrics_path.exists():
-        st.info("No metrics file found in results folder.")
+def render_investigation_panel(selected_index: int, df: pd.DataFrame) -> None:
+    """Render details and actions for selected transaction."""
+    if selected_index >= len(df):
         return
+    selected_txn = df.iloc[selected_index]
+    txn_id = str(selected_txn["ID"])
 
-    try:
-        with open(metrics_path) as f:
-            data = json.load(f)
-        models = data.get("models", {})
-        if not models:
-            st.info("Metrics file exists but has no model entries.")
-            return
+    with st.container(border=True):
+        st.subheader("Investigation Details")
+        st.write(f"**ID:** {txn_id}")
+        st.write(f"**Amount:** ₹{float(selected_txn['Amount']):,.2f}")
+        st.write(f"**Location:** {selected_txn['Location']}")
+        st.info(selected_txn["Context"])
 
-        rows = []
-        for model_name, m in models.items():
-            # Internal metrics are stored in [0, 1]; convert to % for display
-            rows.append({
-                "Model": model_name,
-                "ROC-AUC (%)": round(float(m.get("roc_auc", 0)) * 100, 2),
-                "PR-AUC (%)": round(float(m.get("pr_auc", 0)) * 100, 2),
-                "Precision (%)": round(float(m.get("precision", 0)) * 100, 2),
-                "Recall (%)": round(float(m.get("recall", 0)) * 100, 2),
-                "F1 (%)": round(float(m.get("f1_score", 0)) * 100, 2),
-            })
-        df = pd.DataFrame(rows).sort_values("ROC-AUC (%)", ascending=False)
-
-        st.dataframe(df, use_container_width=True)
-
-        if HAS_PLOTLY:
-            fig = px.bar(
-                df, x="Model", y=["ROC-AUC (%)", "PR-AUC (%)"],
-                barmode="group", title="Model performance (%)",
-                labels={"value": "Score (%)", "variable": "Metric"},
+        action_col_1, action_col_2 = st.columns(2)
+        with action_col_1:
+            fraud_clicked = st.button(
+                "Confirm Fraud & Block",
+                type="primary",
+                use_container_width=True,
             )
-            fig.update_yaxes(ticksuffix="%")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.bar_chart(df.set_index("Model")[["ROC-AUC (%)", "PR-AUC (%)"]])
-    except Exception as e:
-        st.error(f"Could not load metrics: {e}")
+        with action_col_2:
+            safe_clicked = st.button(
+                "Mark as Safe",
+                use_container_width=True,
+            )
+
+        if fraud_clicked:
+            if update_transaction_status(txn_id, "Fraud"):
+                st.success(f"{txn_id} marked as Fraud.")
+            else:
+                st.error("Failed to update status.")
+            st.session_state.selected_index = None
+            st.rerun()
+
+        if safe_clicked:
+            if update_transaction_status(txn_id, "Approved"):
+                st.success(f"{txn_id} marked as Approved.")
+            else:
+                st.error("Failed to update status.")
+            st.session_state.selected_index = None
+            st.rerun()
 
 
-# -------------------------
-# App shell
-# -------------------------
-st.set_page_config(
-    page_title="Fraud Detection Dashboard",
-    page_icon=None,
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+def render_add_transaction_form() -> None:
+    """Render expander form to create and score a dummy transaction."""
+    with st.expander("➕ Add New Transaction (Test / Demo)"):
+        with st.form("new_txn_form", clear_on_submit=True):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                txn_id = st.text_input(
+                    "Transaction ID",
+                    value=f"TXN-{uuid.uuid4().hex[:6].upper()}",
+                )
+                amount = st.number_input("Amount (₹)", min_value=1.0, value=2500.0, step=100.0)
+                merchant = st.text_input("Merchant", value="Amazon")
+                location = st.text_input("Location", value="Mumbai, MH")
+            with col_b:
+                velocity_1h = st.number_input("Velocity (txns last 1 h)", min_value=0, value=1)
+                geo_distance_km = st.number_input("Geo distance from home (km)", min_value=0.0, value=5.0, step=1.0)
+                device_new = st.selectbox("New device?", options=[0, 1], format_func=lambda x: "Yes" if x else "No")
 
-ensure_session_state()
+            submitted = st.form_submit_button("Score & Add Transaction")
 
-with st.sidebar:
-    st.title("Fraud Detection")
-    st.caption("Simple workflow for non-technical users")
-    st.divider()
+        if submitted:
+            payload = {
+                "id": txn_id,
+                "amount": amount,
+                "merchant": merchant,
+                "location": location,
+                "velocity_1h": velocity_1h,
+                "geo_distance_km": geo_distance_km,
+                "device_new": int(device_new),
+            }
 
-    page = st.radio(
-        "Navigation",
-        [
-            "Home",
-            "Transaction Screening",
-            "Case Explanations",
-            "Manual Review Queue",
-            "Alerts and Notifications",
-            "System Health",
-        ],
+            score_resp = score_transaction(payload)
+            insert_transaction(payload, score_resp)
+            st.success(
+                f"✅ **{txn_id}** added — "
+                f"Risk Score: **{score_resp['risk_score']}**, "
+                f"Decision: **{score_resp['decision']}**"
+            )
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    """Main Streamlit app entry point."""
+    st.set_page_config(
+        page_title="Credit Card Fraud Analyst Dashboard",
+        page_icon="🛡️",
+        layout="wide",
     )
 
-    st.divider()
-    st.caption(f"Artifacts folder: {ART_DIR}")
+    st.title("🛡️ Credit Card Fraud Detection — Live Analyst Dashboard")
 
-if page == "Home":
-    page_home()
-elif page == "Transaction Screening":
-    page_transaction_screening()
-elif page == "Case Explanations":
-    page_case_explanations()
-elif page == "Manual Review Queue":
-    page_manual_review_queue()
-elif page == "Alerts and Notifications":
-    page_alerts_and_notifications()
-elif page == "System Health":
-    page_system_health()
+    _init_session_state()
+
+    df: pd.DataFrame = st.session_state.transactions_df
+
+    render_kpis(df)
+    selected_index = render_alert_queue(df)
+
+    if selected_index is not None:
+        st.session_state.selected_index = selected_index
+
+    if st.session_state.selected_index is not None:
+        current_index = st.session_state.selected_index
+        if 0 <= current_index < len(df):
+            render_investigation_panel(current_index, df)
+
+    render_add_transaction_form()
+
+
+if __name__ == "__main__":
+    main()
