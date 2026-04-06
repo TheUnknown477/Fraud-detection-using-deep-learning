@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -96,8 +97,6 @@ def _score_with_model(payload: dict, model: Any) -> tuple[float, list[str]]:
         float(payload.get("geo_distance_km", 0.0)),
         int(payload.get("device_new", 0)),
     ]
-    import numpy as np  # noqa: PLC0415
-
     X = np.array(features, dtype=float).reshape(1, -1)
     prob = float(model.predict_proba(X)[0, 1])
     reasons = [f"Model score: {prob * 100:.1f}"]
